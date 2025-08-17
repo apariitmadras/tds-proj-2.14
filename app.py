@@ -16,7 +16,7 @@ from llm import chat_complete
 from sandbox import run_user_code
 
 APP_NAME = "data-analyst-agent"
-app = FastAPI(title=APP_NAME, version="1.0.1")
+app = FastAPI(title=APP_NAME, version="1.0.2")
 
 # -------------------- CORS --------------------
 app.add_middleware(
@@ -62,7 +62,7 @@ class AnalyzeRequest(BaseModel):
 # -------------------- Health --------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "name": APP_NAME, "version": "1.0.1"}
+    return {"ok": True, "name": APP_NAME, "version": "1.0.2"}
 
 # -------------------- Helpers --------------------
 def _strip_md_fences(s: str) -> str:
@@ -128,7 +128,7 @@ def _payload_inject(user_payload: dict) -> str:
     - Try normal json.loads
     - If that fails, try ast.literal_eval
     - As last resort, return the injected payload object
-    Also exposes TASK / QUESTIONS / RESPONSE_FORMAT globals for convenience.
+    Also exposes TASK / QUESTIONS / RESPONSE_FORMAT globals.
     """
     payload_json_text = json.dumps(user_payload, ensure_ascii=False)
     return (
@@ -209,7 +209,12 @@ async def analyze(
     if not req:
         # Always return a valid answer (never error)
         return fabricate_fallback(["q1"], "JSON array")
-    return await _run_pipeline(req)
+    # Guard against unexpected exceptions in the pipeline
+    try:
+        return await _run_pipeline(req)
+    except Exception as e:
+        log.error("Top-level pipeline failure: %s\n%s", e, traceback.format_exc())
+        return fabricate_fallback(req.questions, req.response_format)
 
 # Optional legacy/compat route
 @app.post("/api")
@@ -225,7 +230,11 @@ async def analyze_compat(
         log.error("Compat parse failed: %s", e)
     if not req:
         return fabricate_fallback(["q1"], "JSON array")
-    return await _run_pipeline(req)
+    try:
+        return await _run_pipeline(req)
+    except Exception as e:
+        log.error("Top-level pipeline failure (compat): %s\n%s", e, traceback.format_exc())
+        return fabricate_fallback(req.questions, req.response_format)
 
 # -------------------- Core pipeline --------------------
 async def _run_pipeline(req: AnalyzeRequest) -> Any:
@@ -234,4 +243,112 @@ async def _run_pipeline(req: AnalyzeRequest) -> Any:
     Always returns a valid JSON in requested format.
     """
     t0 = time.time()
-    d
+    deadline = t0 + PIPELINE_BUDGET
+
+    task = req.task.strip()
+    questions = [q.strip() for q in req.questions]
+    resp_fmt = (req.response_format or "JSON array").strip()
+
+    log.info("Received /api/analyze | format=%s | #questions=%d", resp_fmt, len(questions))
+
+    def time_left() -> int:
+        return max(0, int(deadline - time.time()))
+
+    try:
+        if time_left() <= 0:
+            raise TimeoutError("Budget exceeded before start")
+
+        # -------- Plan --------
+        plan = None
+        try:
+            planner_sys = open(os.path.join(os.path.dirname(__file__), "prompts", "planner.txt"), "r", encoding="utf-8").read()
+            planner_messages = [
+                {"role": "system", "content": planner_sys},
+                {"role": "user", "content": json.dumps({"task": task, "questions": questions}, ensure_ascii=False)},
+            ]
+            if KEY_PLANNER:
+                log.info("Planning... (timeout=%ss)", min(PLANNER_TIMEOUT, time_left()))
+                plan = chat_complete(planner_messages, MODEL_PLANNER, KEY_PLANNER, timeout=min(PLANNER_TIMEOUT, time_left()))
+            else:
+                log.warning("Planner key missing; skipping plan.")
+        except Exception as e:
+            log.warning("Plan failed: %s", e)
+
+        # -------- CodeGen --------
+        code = None
+        try:
+            codegen_sys = open(os.path.join(os.path.dirname(__file__), "prompts", "codegen.txt"), "r", encoding="utf-8").read()
+            user_payload = {
+                "task": task,
+                "questions": questions,
+                "response_format": resp_fmt,
+                "plan": plan or {"steps": ["(no plan — fabricate if needed)"]},
+            }
+            code_messages = [
+                {"role": "system", "content": codegen_sys},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ]
+            if KEY_CODEGEN and time_left() > 0:
+                log.info("Generating code... (timeout=%ss)", min(CODEGEN_TIMEOUT, time_left()))
+                code = chat_complete(code_messages, MODEL_CODEGEN, KEY_CODEGEN, timeout=min(CODEGEN_TIMEOUT, time_left()))
+                code = _strip_md_fences(code)
+                # ---- inject: payload safety, seaborn shim, safe casts ----
+                payload_patch = _payload_inject(user_payload)
+                code = payload_patch + "\n" + SEABORN_SHIM + "\n" + SAFE_CASTS_PRELUDE + "\n" + code
+            else:
+                log.warning("CodeGen key missing or no time left.")
+        except Exception as e:
+            log.warning("CodeGen failed: %s", e)
+
+        answers: Any = None
+
+        # -------- Execute --------
+        if code and time_left() > 0:
+            # ensure headless plotting in the child process
+            os.environ.setdefault("MPLBACKEND", "Agg")
+
+            exec_timeout = min(EXECUTION_TIMEOUT, time_left())
+            log.info("Executing generated code (timeout=%ss)...", exec_timeout)
+            out, err, rc = run_user_code(code, timeout=exec_timeout)
+            log.info("Execution rc=%s bytes_out=%s bytes_err=%s", rc, len(out or ""), len(err or ""))
+
+            if rc == 0 and out:
+                try:
+                    answers = json.loads(out.strip())
+                except Exception as e:
+                    log.warning("Stdout not valid JSON: %s", e)
+                    # -------- Reformat --------
+                    if KEY_ORCH and time_left() > 0:
+                        try:
+                            reform_sys = open(os.path.join(os.path.dirname(__file__), "prompts", "reformat.txt"), "r", encoding="utf-8").read()
+                            re_messages = [
+                                {"role": "system", "content": reform_sys},
+                                {"role": "user", "content": json.dumps({"raw": out, "expected": resp_fmt, "questions": questions}, ensure_ascii=False)},
+                            ]
+                            answers_text = chat_complete(re_messages, MODEL_ORCH, KEY_ORCH, timeout=min(REFORMAT_TIMEOUT, time_left()))
+                            answers = json.loads(answers_text)
+                        except Exception as ee:
+                            log.error("Reformatter failed: %s", ee)
+                    else:
+                        log.warning("No ORCH key or time for reformat.")
+            else:
+                # Log small stderr sample; still return valid output
+                log.warning("Execution failed or empty. stderr: %s", (err or "")[:500])
+        else:
+            log.warning("Skipping execution — no code or no time.")
+
+        # -------- Enforce/Fill --------
+        if answers is None:
+            answers = fabricate_fallback(questions, resp_fmt)
+        try:
+            answers = enforce_format(answers, resp_fmt, len(questions))
+        except Exception as e:
+            log.error("Format enforcement failed: %s", e)
+            answers = fabricate_fallback(questions, resp_fmt)
+
+        return answers
+
+    except Exception as e:
+        log.error("Pipeline error: %s\n%s", e, traceback.format_exc())
+        return fabricate_fallback(questions if 'questions' in locals() else ["q1"],
+                                  resp_fmt if 'resp_fmt' in locals() else "JSON array")
