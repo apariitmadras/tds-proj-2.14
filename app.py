@@ -68,8 +68,71 @@ class AnalyzeResponse(BaseModel):
 def health():
     return {"ok": True, "name": APP_NAME, "version": "0.1.0"}
 
+# ---------- NEW: wrapper that accepts JSON or multipart; core pipeline moved to _run_pipeline ----------
 @app.post("/api/analyze")
-async def analyze(req: AnalyzeRequest) -> Any:
+async def analyze(request: Request,
+                  questions_txt: UploadFile | None = File(None),
+                  file: UploadFile | None = File(None)) -> Any:
+    """
+    Accepts:
+      - JSON body with {task, questions, response_format}
+      - OR multipart/form-data with a text file field:
+          * 'questions.txt' (preferred)
+          * 'file'         (compat)
+    Always returns a valid JSON answer (real or fabricated).
+    """
+    ctype = request.headers.get("content-type", "")
+
+    # JSON path → forward to core
+    if "application/json" in ctype:
+        try:
+            payload = await request.json()
+            req = AnalyzeRequest(**payload)
+            return await _run_pipeline(req)
+        except Exception as e:
+            log.error("JSON parse failed: %s", e)
+            return fabricate_fallback(["q1"], "JSON array")
+
+    # Multipart path → read whichever file is present
+    upl = questions_txt or file
+    if upl is None:
+        return fabricate_fallback(["q1"], "JSON array")
+
+    try:
+        text = (await upl.read()).decode("utf-8", "ignore").strip()
+    except Exception as e:
+        log.error("Reading uploaded file failed: %s", e)
+        return fabricate_fallback(["q1"], "JSON array")
+
+    # If the file itself is JSON with task/questions/response_format, use it directly
+    try:
+        data = json.loads(text)
+        req = AnalyzeRequest(**data)
+        return await _run_pipeline(req)
+    except Exception:
+        pass
+
+    # Otherwise parse a free-text prompt file:
+    # - first paragraph → task
+    # - numbered lines ("1) ...", "2. ...", "3 - ...") → questions
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    task = paragraphs[0] if paragraphs else "Ad-hoc task from questions.txt"
+
+    qs: List[str] = []
+    for ln in text.splitlines():
+        m = re.match(r"\s*\d+\s*[\.\)\-:]\s*(.+)", ln)
+        if m:
+            qs.append(m.group(1).strip())
+
+    if not qs:
+        qs = [task]
+        task = "Ad-hoc task from questions.txt"
+
+    req = AnalyzeRequest(task=task, questions=qs, response_format="JSON array")
+    return await _run_pipeline(req)
+
+
+async def _run_pipeline(req: AnalyzeRequest) -> Any:
     """
     Main pipeline:
       1) Plan
@@ -186,3 +249,4 @@ async def analyze(req: AnalyzeRequest) -> Any:
     except Exception as e:
         log.error("Pipeline error: %s\n%s", e, traceback.format_exc())
         return fabricate_fallback(questions, resp_fmt)
+# ---------- END ----------
