@@ -68,7 +68,16 @@ class AnalyzeResponse(BaseModel):
 def health():
     return {"ok": True, "name": APP_NAME, "version": "0.1.0"}
 
-# ---------- NEW: wrapper that accepts JSON or multipart; core pipeline moved to _run_pipeline ----------
+# ---------- helper: strip markdown code fences from LLM code ----------
+def _strip_md_fences(s: str) -> str:
+    if not s:
+        return s
+    s = s.strip()
+    s = re.sub(r'^\s*```(?:[a-zA-Z0-9_+\-]+)?\s*', '', s)
+    s = re.sub(r'\s*```\s*$', '', s)
+    return s
+
+# ---------- wrapper that accepts JSON or multipart; core pipeline in _run_pipeline ----------
 @app.post("/api/analyze")
 async def analyze(request: Request,
                   questions_txt: UploadFile | None = File(None),
@@ -194,6 +203,7 @@ async def _run_pipeline(req: AnalyzeRequest) -> Any:
         if KEY_CODEGEN and time_left() > 0:
             log.info("Generating code... (timeout=%ss)", min(CODEGEN_TIMEOUT, time_left()))
             code = chat_complete(code_messages, MODEL_CODEGEN, KEY_CODEGEN, timeout=min(CODEGEN_TIMEOUT, time_left()))
+            code = _strip_md_fences(code)  # <-- minimal fix: remove ``` fences
         else:
             log.warning("Codegen key missing or no time left.")
 
