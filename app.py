@@ -16,7 +16,7 @@ from llm import chat_complete
 from sandbox import run_user_code
 
 APP_NAME = "data-analyst-agent"
-app = FastAPI(title=APP_NAME, version="1.0.0")
+app = FastAPI(title=APP_NAME, version="1.0.1")
 
 # -------------------- CORS --------------------
 app.add_middleware(
@@ -62,7 +62,7 @@ class AnalyzeRequest(BaseModel):
 # -------------------- Health --------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "name": APP_NAME, "version": "1.0.0"}
+    return {"ok": True, "name": APP_NAME, "version": "1.0.1"}
 
 # -------------------- Helpers --------------------
 def _strip_md_fences(s: str) -> str:
@@ -74,7 +74,7 @@ def _strip_md_fences(s: str) -> str:
     s = re.sub(r'\s*```\s*$', '', s)
     return s
 
-# ---- seaborn shim (injected into user script if seaborn not installed) ----
+# ---- seaborn shim (injected if seaborn not installed) ----
 SEABORN_SHIM = r"""
 try:
     import seaborn as sns  # type: ignore
@@ -122,6 +122,35 @@ def _safe_float(x):
 float = _safe_float
 """
 
+def _payload_inject(user_payload: dict) -> str:
+    """
+    Injects the *true* payload and wraps json.loads to be resilient:
+    - Try normal json.loads
+    - If that fails, try ast.literal_eval
+    - As last resort, return the injected payload object
+    Also exposes TASK / QUESTIONS / RESPONSE_FORMAT globals for convenience.
+    """
+    payload_json_text = json.dumps(user_payload, ensure_ascii=False)
+    return (
+        "import json, ast\n"
+        f"__DAA_PAYLOAD_JSON__ = r'''{payload_json_text}'''\n"
+        "__DAA_PAYLOAD_OBJ__ = json.loads(__DAA_PAYLOAD_JSON__)\n"
+        "__json_loads_orig = json.loads\n"
+        "def __daa_json_loads(s, *a, **k):\n"
+        "    try:\n"
+        "        return __json_loads_orig(s, *a, **k)\n"
+        "    except Exception:\n"
+        "        try:\n"
+        "            return ast.literal_eval(s)\n"
+        "        except Exception:\n"
+        "            return __DAA_PAYLOAD_OBJ__\n"
+        "json.loads = __daa_json_loads\n"
+        "TASK = __DAA_PAYLOAD_OBJ__.get('task','')\n"
+        "QUESTIONS = __DAA_PAYLOAD_OBJ__.get('questions',[])\n"
+        "RESPONSE_FORMAT = __DAA_PAYLOAD_OBJ__.get('response_format','JSON array')\n"
+    )
+
+# -------------------- Build request from HTTP --------------------
 async def _build_analyze_request_from_http(
     request: Request,
     questions_txt: Optional[UploadFile],
@@ -143,14 +172,14 @@ async def _build_analyze_request_from_http(
         return None
     txt = (await upl.read()).decode("utf-8", "ignore").strip()
 
-    # If file itself is JSON {task, questions, response_format}
+    # If file is JSON {task, questions, response_format}
     try:
         data = json.loads(txt)
         return AnalyzeRequest(**data)
     except Exception:
         pass
 
-    # Otherwise parse free-text file
+    # Parse free-text file
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", txt) if p.strip()]
     task = paragraphs[0] if paragraphs else "Ad-hoc task from questions.txt"
 
@@ -205,111 +234,4 @@ async def _run_pipeline(req: AnalyzeRequest) -> Any:
     Always returns a valid JSON in requested format.
     """
     t0 = time.time()
-    deadline = t0 + PIPELINE_BUDGET
-
-    task = req.task.strip()
-    questions = [q.strip() for q in req.questions]
-    resp_fmt = (req.response_format or "JSON array").strip()
-
-    log.info("Received /api/analyze | format=%s | #questions=%d", resp_fmt, len(questions))
-
-    def time_left() -> int:
-        return max(0, int(deadline - time.time()))
-
-    try:
-        if time_left() <= 0:
-            raise TimeoutError("Budget exceeded before start")
-
-        # -------- Plan --------
-        plan = None
-        try:
-            planner_sys = open(os.path.join(os.path.dirname(__file__), "prompts", "planner.txt"), "r", encoding="utf-8").read()
-            planner_messages = [
-                {"role": "system", "content": planner_sys},
-                {"role": "user", "content": json.dumps({"task": task, "questions": questions}, ensure_ascii=False)},
-            ]
-            if KEY_PLANNER:
-                log.info("Planning... (timeout=%ss)", min(PLANNER_TIMEOUT, time_left()))
-                plan = chat_complete(planner_messages, MODEL_PLANNER, KEY_PLANNER, timeout=min(PLANNER_TIMEOUT, time_left()))
-            else:
-                log.warning("Planner key missing; skipping plan.")
-        except Exception as e:
-            log.warning("Plan failed: %s", e)
-
-        # -------- CodeGen --------
-        code = None
-        try:
-            codegen_sys = open(os.path.join(os.path.dirname(__file__), "prompts", "codegen.txt"), "r", encoding="utf-8").read()
-            user_payload = {
-                "task": task,
-                "questions": questions,
-                "response_format": resp_fmt,
-                "plan": plan or {"steps": ["(no plan — fabricate if needed)"]},
-            }
-            code_messages = [
-                {"role": "system", "content": codegen_sys},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ]
-            if KEY_CODEGEN and time_left() > 0:
-                log.info("Generating code... (timeout=%ss)", min(CODEGEN_TIMEOUT, time_left()))
-                code = chat_complete(code_messages, MODEL_CODEGEN, KEY_CODEGEN, timeout=min(CODEGEN_TIMEOUT, time_left()))
-                code = _strip_md_fences(code)
-                # inject shims before user code
-                code = SEABORN_SHIM + "\n" + SAFE_CASTS_PRELUDE + "\n" + code
-            else:
-                log.warning("CodeGen key missing or no time left.")
-        except Exception as e:
-            log.warning("CodeGen failed: %s", e)
-
-        answers: Any = None
-
-        # -------- Execute --------
-        if code and time_left() > 0:
-            # ensure headless plotting in the child process
-            os.environ.setdefault("MPLBACKEND", "Agg")
-
-            exec_timeout = min(EXECUTION_TIMEOUT, time_left())
-            log.info("Executing generated code (timeout=%ss)...", exec_timeout)
-            out, err, rc = run_user_code(code, timeout=exec_timeout)
-            log.info("Execution rc=%s bytes_out=%s bytes_err=%s", rc, len(out or ""), len(err or ""))
-
-            if rc == 0 and out:
-                try:
-                    answers = json.loads(out.strip())
-                except Exception as e:
-                    log.warning("Stdout not valid JSON: %s", e)
-                    # -------- Reformat --------
-                    if KEY_ORCH and time_left() > 0:
-                        try:
-                            reform_sys = open(os.path.join(os.path.dirname(__file__), "prompts", "reformat.txt"), "r", encoding="utf-8").read()
-                            re_messages = [
-                                {"role": "system", "content": reform_sys},
-                                {"role": "user", "content": json.dumps({"raw": out, "expected": resp_fmt, "questions": questions}, ensure_ascii=False)},
-                            ]
-                            answers_text = chat_complete(re_messages, MODEL_ORCH, KEY_ORCH, timeout=min(REFORMAT_TIMEOUT, time_left()))
-                            answers = json.loads(answers_text)
-                        except Exception as ee:
-                            log.error("Reformatter failed: %s", ee)
-                    else:
-                        log.warning("No ORCH key or time for reformat.")
-            else:
-                # Log a small stderr sample for debugging; still return valid output
-                log.warning("Execution failed or empty. stderr: %s", (err or "")[:500])
-        else:
-            log.warning("Skipping execution — no code or no time.")
-
-        # -------- Enforce/Fill --------
-        if answers is None:
-            answers = fabricate_fallback(questions, resp_fmt)
-        try:
-            answers = enforce_format(answers, resp_fmt, len(questions))
-        except Exception as e:
-            log.error("Format enforcement failed: %s", e)
-            answers = fabricate_fallback(questions, resp_fmt)
-
-        return answers
-
-    except Exception as e:
-        log.error("Pipeline error: %s\n%s", e, traceback.format_exc())
-        return fabricate_fallback(questions if 'questions' in locals() else ["q1"],
-                                  resp_fmt if 'resp_fmt' in locals() else "JSON array")
+    d
