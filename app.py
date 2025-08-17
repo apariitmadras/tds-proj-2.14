@@ -77,6 +77,41 @@ def _strip_md_fences(s: str) -> str:
     s = re.sub(r'\s*```\s*$', '', s)
     return s
 
+# ---------- tiny seaborn shim (only used if seaborn is missing) ----------
+SEABORN_SHIM = r"""
+# ---- seaborn shim (only if seaborn unavailable) ----
+try:
+    import seaborn as sns  # type: ignore
+except Exception:
+    class _SNSShim:
+        def scatterplot(self, data=None, x=None, y=None, **kwargs):
+            import matplotlib.pyplot as plt
+            if data is not None and x is not None and y is not None:
+                plt.scatter(data[x], data[y], **{k:v for k,v in kwargs.items() if k not in ("data","x","y")})
+            elif x is not None and y is not None:
+                plt.scatter(x, y, **kwargs)
+        def lineplot(self, *args, **kwargs):
+            import matplotlib.pyplot as plt
+            plt.plot(*args, **kwargs)
+        def regplot(self, x=None, y=None, data=None, **kwargs):
+            import numpy as np
+            import matplotlib.pyplot as plt
+            if data is not None and x is not None and y is not None:
+                X = data[x].values
+                Y = data[y].values
+            else:
+                X, Y = x, y
+            plt.scatter(X, Y)
+            if X is not None and Y is not None:
+                try:
+                    m, b = np.polyfit(np.asarray(X, dtype=float), np.asarray(Y, dtype=float), 1)
+                    plt.plot(X, m*np.asarray(X, dtype=float) + b, linestyle=":", linewidth=2)
+                except Exception:
+                    pass
+    sns = _SNSShim()
+# ---- end seaborn shim ----
+"""
+
 # ---------- wrapper that accepts JSON or multipart; core pipeline in _run_pipeline ----------
 @app.post("/api/analyze")
 async def analyze(request: Request,
@@ -203,7 +238,9 @@ async def _run_pipeline(req: AnalyzeRequest) -> Any:
         if KEY_CODEGEN and time_left() > 0:
             log.info("Generating code... (timeout=%ss)", min(CODEGEN_TIMEOUT, time_left()))
             code = chat_complete(code_messages, MODEL_CODEGEN, KEY_CODEGEN, timeout=min(CODEGEN_TIMEOUT, time_left()))
-            code = _strip_md_fences(code)  # <-- minimal fix: remove ``` fences
+            code = _strip_md_fences(code)  # remove ``` fences
+            # inject seaborn shim before user code to avoid ModuleNotFoundError
+            code = SEABORN_SHIM + "\n" + code
         else:
             log.warning("Codegen key missing or no time left.")
 
@@ -211,6 +248,9 @@ async def _run_pipeline(req: AnalyzeRequest) -> Any:
 
         # 3) EXECUTE
         if code and time_left() > 0:
+            # force headless backend for matplotlib in the child process
+            os.environ.setdefault("MPLBACKEND", "Agg")
+
             exec_timeout = min(EXECUTION_TIMEOUT, time_left())
             log.info("Executing generated code (timeout=%ss)...", exec_timeout)
             out, err, rc = run_user_code(code, timeout=exec_timeout)
